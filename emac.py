@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 
 '''
-FIXME
-=====
-* get System Folder:Extensions:Multiprocessing:CPU Plugins usable
-
 FIXED
 =====
 * sound!
+  - is in stereo and the control panel works reasonably ok (flickers a bit)
+* boots even when System Folder:Extensions:Multiprocessing:CPU Plugins is present
 
 '''
 
@@ -26,11 +24,12 @@ from ast import literal_eval as eval
 
 src, cleanup = patch_common.get_src(desc='''
 Boot the late-model eMac (USB 2.0 2004 & 2005). Works on Mac OS ROM v6.7 and later (Mac OS 9.1, late '01).
-First, patches the boot script to (a) add PowerMac6,4/5 to the COMPATIBLE tag,
-(b) pretend that the machine is a Cube and (c) add a prim-info property to the
-PMU device. Second, patches the NanoKernel to prevent the CPU Plugin from
-hanging when a THRM register access silently fails. Third, if necessary, patches
-the Kauai ATA driver into old ROMs (pre-9.1).
+First, patches the Bootinfo text in the ROM to:
+  (a) add PowerMac6,4 to the COMPATIBLE tag
+      * this enables the OpenFirmware boot-picker's option to boot OS9
+  (b) prepend forth to the boot-script that adjusts OF device properties to simulate a 1st-gen eMac
+Second, patches the NanoKernel to prevent the CPU Plugin from hanging when a THRM register access silently fails.
+Third, if necessary, patches the Kauai ATA driver into old ROMs (pre-9.1).
 Fourth, patches and inserts a native driver parcel for the ATI Radeon 9200
 (ATY,RockHopper2 [[emac used ATV,Merlin]]), to enable acceleration with the c.2005 ATI Extensions.
 ''')
@@ -78,6 +77,7 @@ def patch_nk_proc_table(orig):
 # test for a non-THRM CPU, and return an error in this case. (The NK is involved
 # because it invokes the CPUP fragment in supervisor mode in response to an
 # MPCpuPlugin call.)
+# MPCpuPlugin API details: https://opensource.apple.com/source/xnu/xnu-201/osfmk/ppc/POWERMAC/mp/MPPlugIn.h.auto.html
 
 def patch_nk_mpcpuplugin(orig):
     try:
@@ -157,6 +157,7 @@ def patch_nk_mpcpuplugin(orig):
         return orig
 
 # eMac 2004           000000ff 00000060 000061a8 00016705 00001400 00000000 0000260d 46000278 783c00
+# w/sound+CPU plugins 000000ff 0000002c 00030d40 00016705 00001400 00000000 0000260d 46000278 783c00
 # iBook G4            000000ff 00000060 00003e80 00017fb5 0202d607 00000000 00011300 46000220
 # Power Mac G4 MDD    000000ff 0000002c 00030d40 0001e705 00003400 00000000 0000260d 46000270
 # patched macmini     000000ff 0000002c 00030d40 0001e705 00001400 00000000 0000260d 46000270
@@ -303,27 +304,27 @@ def patch_nk_mpcpuplugin(orig):
 
 
 FORTH = r'''
-\ Hacks for late-model eMacs, should not affect other machines
-" /" select-dev " model" active-package get-package-property 0= if
-    decode-string 2swap 2drop 2dup " PowerMac6,4" $= -rot " PowerMac6,5" $= or if
+\ Pretend to be a early-model eMac
+" /" select-dev
+    " PowerMac4,4" encode-string 2dup
+    " model" property
+    " MacRISC" encode-string encode+
+    " MacRISC2" encode-string encode+
+    " Power Macintosh" encode-string encode+
+    " compatible" property
+device-end
 
-        \ Pretend to be a early-model eMac
-        " /" select-dev
-            " PowerMac4,4" encode-string 2dup
-            " model" property
-            " MacRISC" encode-string encode+
-            " MacRISC2" encode-string encode+
-            " Power Macintosh" encode-string encode+
-            " compatible" property
-        device-end
+\ Pretend to have a PowerPC 7445/55, actual PVR unaffected
+" /cpus/PowerPC,G4@0" select-dev
+    80010201 encode-int " cpu-version" property
+device-end
 
-        \ Pretend to have a PowerPC 7445/55, actual PVR unaffected
-        " /cpus/PowerPC,G4@0" select-dev
-            80010201 encode-int " cpu-version" property
-        device-end
-
-    then
-then \ End of eMac hacks
+\ Set prim-info (for PwrMgr v2 in NativePowerMgrLib)
+" via-pmu/power-mgt" select-dev
+    " "(000000ff 0000002c 00030d40 00016705 00001400 00000000 0000260d 46000278 783c00)" encode-bytes
+    " prim-info" property
+device-end
+\ End of eMac Hacks
 '''.strip()
 
 def patch_booter(text):
@@ -428,8 +429,15 @@ for (parent, folders, files) in os.walk(src):
 
         elif filename == 'Bootscript':
             text = open(full).read()
-            text = patch_booter(text)
-            open(full, 'w').write(text)
+            if "eMac G4 2004" in text:
+                # using custom newworld-rom with emac specific Bootscript
+                print("custom bootscript found, not modifying:")
+                print(text)
+            else:
+                text = patch_booter(text)
+                open(full, 'w').write(text)
+                print("patched bootscript:")
+                print(text)
 
         elif filename == 'Parcelfile':
             if not any(fnmatch.fnmatch(fn, 'kauai-ata*.pef') for fn in os.listdir(parent)):
@@ -459,6 +467,8 @@ for (parent, folders, files) in os.walk(src):
                         '\tndrv flags=0x00004 name=driver,AAPL,MacOS,PowerPC src=%s\n\n' % path.basename(ndrv2)]
                     f.seek(0)
                     f.writelines(lines)
+            else:
+                print('source ROM already has RockHopper2 driver!')
 
             if path.exists(path.join(parent, 'MotherBoardHAL.pef')):
                 print('ROM has MotherBoardHAL (< ROM 6.7), therefore unlikely to work')
