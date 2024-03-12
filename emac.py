@@ -363,7 +363,7 @@ for (parent, folders, files) in os.walk(src):
                     f.write('\tndrv flags=0x00006 name=driver,AAPL,MacOS,PowerPC src=kauai-ata.pef.lzss\n\n')
 
             if not any(fnmatch.fnmatch(fn, 'ATY,Merlin*.pef') for fn in os.listdir(parent)):
-                print('Adding ATY,Merlin ndrv parcel (v1.0.?, OS X 10.4.x). Credit to micro:')
+                print('Adding ATY,Merlin ndrv parcel (v1.0.?, OS X 10.4.x). Credit to user "wired":')
                 print('http://macos9lives.com/smforum/index.php?topic=4361.msg53650#msg53650')
                 ndrv1 = path.join(path.dirname(__file__), 'ATY,Merlin_10.3.7.pef') # from OSX panther?
                 # pef's are harvested from /System/Library/Extensions/AppleNDRV/ATIDriver.bundle/Contents/MacOS/ATIDriver
