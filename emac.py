@@ -19,6 +19,7 @@ import os
 import struct
 import fnmatch
 import tempfile
+from ast import literal_eval as eval
 
 src, cleanup = patch_common.get_src(desc='''
 Boot the late-model eMac (USB 2.0 2004 & 2005). Works on Mac OS ROM v6.7 and later (Mac OS 9.1, late '01).
@@ -330,6 +331,90 @@ def patch_booter(text):
     text = text.replace('<BOOT-SCRIPT>', '<BOOT-SCRIPT>\n'+FORTH, 1)
     return text
 
+
+# The 2004 eMac's Radeon 9200 is an ATY,Merlin with PCI device ID 5962, which is
+# unknown to ATI's OS 9 driver package. First, we need an ndrv, which would
+# usually be shipped in the card ROM and sometimes replaced by the "ATI ROM
+# Xtender". Mac OS X shipped with 200+ of these, and darthnVader found that the
+# RockHopper2 ndrv from 10.3.6 works great, while 10.3.8+ has a graypage problem.
+# We use the "parcel" mechanism to insert this into the device tree. To enable
+# acceleration, the on-disk ATI extensions require Status 128 (ATIGetInfo) calls
+# to the ndrv to return a known device ID (offset 0x4e in the struct). ID 5961
+# (also Radeon 9200) seems to keep everything happy. The code below patches reads
+# from PCI config space to this end. (The extensions passed around in
+# "9200os9.sit", supposedly for the DVI-I Radeon 9200, do not work. The accl 4
+# "GraphicsAccelerationR6" resource of ATI Graphics Accelerator has apparently
+# been bin-patched to replace 5961 with 5960.)
+
+def patch_rockhopper_ndrv(src, dest=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        cfmtool.dump(src, tmp)
+
+        glue_file = eval(open(path.join(tmp, 'hdump', 'codelocs-xtocglue.txt')).read())
+        glue_info = next(d for d in glue_file if d['function'] == 'ExpMgrConfigReadLong')
+
+        code_path = path.join(tmp, glue_info['section'])
+        code = bytearray(open(code_path, 'rb').read())
+        while len(code) % 4: code.append(0) # align just in case
+
+        # All calls to ExpMgrConfigReadLong go through this "cross-TOC glue" function...
+        glue_offset = glue_info['offset']
+        glue_toc, = struct.unpack_from('>h', code, glue_offset + 2)
+
+        print('ATY,RockHopper2 patch: catching %s to change device 0x5962 to 0x5961' % glue_info['function'])
+
+        # ...So replace it with a branch to the end of the code
+        code[glue_offset:glue_offset+4] = assemble('b %d' % (len(code) - glue_offset))
+        for i in range(glue_offset+4, glue_offset+24, 4): code[i:i+4] = assemble('nop')
+
+        code.extend(assemble("""
+                mflr    r0                  # Standard stack setup
+                stw     r0, 8(r1)
+                stw     r2, 0x14(r1)        # Essential, caller uses this
+                stwu    r1, -0x40(r1)
+
+                stw     r4, 0x38(r1)        # Make the call,
+                stw     r5, 0x3c(r1)        # but save the args first
+                bl      ExpMgrConfigReadLong
+
+                cmpwi   cr0, r3, 0          # If call failed, punt
+                bne     cr0, return
+
+                lwz     r4, 0x38(r1)        # If wrong address, punt
+                cmpwi   cr0, r4, 0
+                bne     cr0, return
+
+                lwz     r5, 0x3c(r1)        # If wrong returned value, punt
+                lwz     r8, 0(r5)
+                lis     r7, 0x5962
+                ori     r7, r7, 0x1002
+                cmpw    cr0, r7, r8
+                bne     cr0, return
+
+                lis     r8, 0x5961          # Save the new returned value
+                ori     r8, r8, 0x1002
+                stw     r8, 0(r5)
+
+            return:                         # Stack teardown
+                lwz     r1, 0(r1)
+                lwz     r0, 8(r1)
+                mtlr    r0
+                blr
+
+            # r3=opaqueNRptr, r4=config_addr, r5=result_ptr
+            ExpMgrConfigReadLong:
+                lwz     r12, {toc}(r2)
+                stw     r2, 0x14(r1)
+                lwz     r0, 0(r12)
+                lwz     r2, 4(r12)
+                mtctr   r0
+                bctr
+        """.format(toc=glue_toc)))
+
+        open(code_path, 'wb').write(code)
+        return cfmtool.build(tmp, dest)
+
+
 for (parent, folders, files) in os.walk(src):
     folders.sort(); files.sort() # make it kinda deterministic
     for filename in files:
@@ -362,34 +447,49 @@ for (parent, folders, files) in os.walk(src):
                     f.write('prop flags=0x0000c a=kauai-ata b=ata\n')
                     f.write('\tndrv flags=0x00006 name=driver,AAPL,MacOS,PowerPC src=kauai-ata.pef.lzss\n\n')
 
-            if not any(fnmatch.fnmatch(fn, 'ATY,Merlin*.pef') for fn in os.listdir(parent)):
-                print('Adding ATY,Merlin ndrv parcel (v1.0.?, OS X 10.4.x). Credit to user "wired":')
-                print('http://macos9lives.com/smforum/index.php?topic=4361.msg53650#msg53650')
-                ndrv1 = path.join(path.dirname(__file__), 'ATY,Merlin_10.3.7.pef') # from OSX panther?
-                # pef's are harvested from /System/Library/Extensions/AppleNDRV/ATIDriver.bundle/Contents/MacOS/ATIDriver
+            if not any(fnmatch.fnmatch(fn, 'ATY*.pef') for fn in os.listdir(parent)):
+                # we need to provide a NDRV to convince the ATI extensions to not load theirs instead (which have the wrong device IDs)
+                # see: https://lists.ucc.gu.uwa.edu.au/pipermail/cdg5/2019-October/000226.html
+
+                # NDRV .pef's are harvested from /System/Library/Extensions/AppleNDRV/ATIDriver.bundle/Contents/MacOS/ATIDriver
                 #   see: http://macos9lives.com/smforum/index.php?topic=4319#msg36062
                 #   * search for ATY,Merlin
                 #   * extract all surrounding bytes from /^((Joy!preffpwpc).*ATY,Merlin.*)Joy!preffpwpc/
                 # .pefs from tiger & "sorbet" would grey-screen after the ATI extensions were loaded
-                # more about how these are used: https://lists.ucc.gu.uwa.edu.au/pipermail/cdg5/2019-October/000226.html
 
+                src_ndrv = 'ATY,Merlin_10.3.7.pef' # from OSX panther?
+                ndrv_name = 'ATY,Merlin'
+                print('Adding ATY,Merlin ndrv parcel (v1.0.?, OS X 10.4.x). Credit to user "wired":')
+                print('http://macos9lives.com/smforum/index.php?topic=4361.msg53650#msg53650')
+                # this seems to work with the January 2005 drivers (remove all ATI extensions, then run the RADEON Update installer)
+                # the "rare" July 2005 update does not work.
+
+                ## src_ndrv = 'ATY,RockHopper2-1.0.1f63-20040916.133447.pef'
+                ## ndrv_name = 'ATY,RockHopper2'
+                ## print('Adding ATY,RockHopper2 ndrv parcel (v1.0.1f63, OS X 10.3.6). Credit to darthnVader:')
+                ## print('http://macos9lives.com/smforum/index.php?topic=2408#msg29393')
+                #   blackscreens after ATI extensions are loaded
+                #       *unless* hacked "ATI Merlin Driver" extension also installed, which crashes the mouse pointer every 10th startup or so: http://macos9lives.com/smforum/index.php?topic=4322.0
+
+                ndrv1 = path.join(path.dirname(__file__), src_ndrv)
                 ndrv2 = path.join(parent, path.basename(ndrv1))
                 shutil.copy(ndrv1, ndrv2)
 
+                patch_rockhopper_ndrv(ndrv2, ndrv2)
+                # if you don't use the patch, "ATI Graphics Accelerator" extension fails to start up and you don't get 2d/3d acceleration
                 # override existing video driver compatibility entries, this one must come before the cofb parcel
                 with open(full, 'r+') as f:
                     lines = f.readlines()
                     idx = next(i for (i, ln) in enumerate(lines) if ' b=display' in ln)
-                    lines[idx:idx] = ['prop flags=0x0000c a=ATY,Merlin b=display\n',
-                        '\tndrv flags=0x00004 name=driver,AAPL,MacOS,PowerPC src=%s\n\n' % path.basename(ndrv2)]
+                    lines[idx:idx] = [
+                        'prop flags=0x0000c a=%s b=display\n' % ndrv_name,
+                        '\tndrv flags=0x00004 name=driver,AAPL,MacOS,PowerPC src=%s\n\n' % path.basename(ndrv2)
+                    ]
                     f.seek(0)
                     f.writelines(lines)
+                print('added {} to Parcelfile => {}'.format(ndrv_name, src_ndrv))
             else:
-                print('source ROM already has Merlin driver!')
-
-            if any(fnmatch.fnmatch(fn, 'ATY,RockHopper2*.pef') for fn in os.listdir(parent)):
-                print('source ROM already has Rockhopper2 driver, removing it!')
-                os.remove(full)
+                print('source ROM already has ATI driver?!')
 
             if path.exists(path.join(parent, 'MotherBoardHAL.pef')):
                 print('ROM has MotherBoardHAL (< ROM 6.7), therefore unlikely to work')
